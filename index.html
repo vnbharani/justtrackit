@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JustTrackIt</title>
+<style>
+  /* Plain styling, no framework. */
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 640px;
+         margin: 0 auto; padding: 16px; line-height: 1.5; color: #222; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { font-size: 1.1rem; margin: 24px 0 8px; }
+  .sub { color: #666; margin: 0 0 16px; }
+  label { display: block; font-weight: 600; margin: 12px 0 4px; }
+  input[type="text"], input[type="number"], input[type="date"],
+  select, textarea {
+    width: 100%; padding: 10px; font-size: 1rem;
+    border: 1px solid #bbb; border-radius: 8px; }
+  textarea { min-height: 64px; resize: vertical; }
+  button { padding: 10px 16px; font-size: 1rem; border: none; border-radius: 8px;
+           background: #2e7d32; color: #fff; cursor: pointer; margin-top: 12px; }
+  button.secondary { background: #eee; color: #222; }
+  button.danger { background: #b3261e; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: end; }
+  .row > * { flex: 1; }
+  .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 8px 0; }
+  .unknown { background: #fff8e1; border-color: #e6c200; }
+  .source { font-size: 0.85rem; color: #555; }
+  .totals { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .totals .card { text-align: center; margin: 0; }
+  .totals .big { font-size: 1.3rem; font-weight: 700; }
+  .meal-group { margin: 12px 0; }
+  .meal-group h3 { margin: 8px 0 4px; text-transform: capitalize; }
+  .entry { display: flex; justify-content: space-between; gap: 8px;
+           padding: 8px 0; border-top: 1px solid #eee; }
+  .entry .nums { white-space: nowrap; text-align: right; }
+  .entry input { width: 64px; padding: 4px; }
+  .hint { font-size: 0.85rem; color: #666; }
+  .hidden { display: none; }
+  #status { min-height: 1.2em; color: #555; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<h1>JustTrackIt</h1>
+<p class="sub">Voice or type what you ate. Every number comes from a food database or from you — never guessed.</p>
+
+<!-- Settings: USDA key is optional. Open Food Facts needs no key. -->
+<details>
+  <summary>Settings — USDA API key (optional)</summary>
+  <label for="usdaKey">USDA FoodData Central API key</label>
+  <input type="text" id="usdaKey" placeholder="Paste your free key here">
+  <p class="hint">Free key from api.nal.usda.gov. Without a key, lookups use Open Food Facts only. The key is stored only in this browser.</p>
+  <button id="saveKey" class="secondary">Save key</button>
+</details>
+
+<!-- Log a food -->
+<h2>Log food</h2>
+<label for="foodText">What did you eat, and how much?</label>
+<textarea id="foodText" placeholder="e.g. 1 cup cooked red rice&#10;or: 1 protein bar, 230 calories, 18g protein"></textarea>
+<div class="row">
+  <div>
+    <label for="meal">Meal</label>
+    <select id="meal">
+      <option>breakfast</option>
+      <option>11am</option>
+      <option>lunch</option>
+      <option>3pm snack</option>
+      <option>dinner</option>
+      <option>extra</option>
+    </select>
+  </div>
+  <div>
+    <label for="barcode">Barcode (optional)</label>
+    <input type="text" id="barcode" inputmode="numeric" placeholder="e.g. 7622210950772">
+  </div>
+</div>
+<div class="row">
+  <button id="micBtn" type="button">🎤 Speak</button>
+  <button id="lookupBtn" type="button">Look it up</button>
+</div>
+<p id="status" class="hint"></p>
+
+<!-- Review before anything is saved -->
+<section id="reviewSection" class="hidden">
+  <h2>Check before it logs</h2>
+  <div id="reviewList"></div>
+  <button id="saveBtn" type="button">Log it</button>
+  <button id="cancelBtn" type="button" class="secondary">Cancel</button>
+</section>
+
+<!-- Day view -->
+<h2>Today</h2>
+<label for="dayPicker">Day</label>
+<input type="date" id="dayPicker">
+<div class="totals" id="totals"></div>
+<div id="entries"></div>
+
+<script>
+"use strict";
+
+/* ---------- Targets (hers) ---------- */
+const TARGETS = { calories: [1850, 1900], carbs: 213, protein: 105, fat: 60, fiber: 25 };
+
+/* ---------- Storage (local only, no server) ---------- */
+const ENTRIES_KEY = "justtrackit.entries.v1";
+const KEY_KEY = "justtrackit.usdaKey.v1";
+
+function loadEntries() {
+  try { return JSON.parse(localStorage.getItem(ENTRIES_KEY)) || []; }
+  catch (e) { return []; }
+}
+function saveEntries(list) {
+  localStorage.setItem(ENTRIES_KEY, JSON.stringify(list));
+}
+function todayString() {
+  const d = new Date();
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0")
+    + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+/* ---------- Parse what she typed or said ----------
+   Pulls out a food name, an amount, and any numbers she stated.
+   Her stated numbers always win over the database. */
+function parseInput(text) {
+  const stated = {};
+  const num = (re) => { const m = text.match(re); return m ? parseFloat(m[1]) : null; };
+  // Calories are unmistakable ("230 calories"). For protein/carbs/fat/fiber
+  // the "g" is required — otherwise "1 protein bar" would read as 1 g protein.
+  stated.calories = num(/(\d+(?:\.\d+)?)\s*(?:kcal|calories?|cals?)\b/i);
+  stated.protein  = num(/(\d+(?:\.\d+)?)\s*(?:g|grams?)\s*(?:of\s+)?protein\b/i);
+  stated.carbs    = num(/(\d+(?:\.\d+)?)\s*(?:g|grams?)\s*(?:of\s+)?carb(?:s|ohydrate)?s?\b/i);
+  stated.fat      = num(/(\d+(?:\.\d+)?)\s*(?:g|grams?)\s*(?:of\s+)?fat\b/i);
+  stated.fiber    = num(/(\d+(?:\.\d+)?)\s*(?:g|grams?)\s*(?:of\s+)?fib(?:er|re)\b/i);
+
+  // Amount in grams — but not when the grams belong to a nutrient
+  // ("18g protein" is 18 g of protein, not an 18 g portion).
+  let grams = null;
+  const g = text.match(/(\d+(?:\.\d+)?)\s*(?:g|grams?)\b(?!\s*(?:protein|carbs?|carbohydrates?|fat|fib(?:er|re)))/i);
+  if (g) grams = parseFloat(g[1]);
+
+  // Food name: strip the numbers so the search gets clean words.
+  let name = text
+    .replace(/(\d+(?:\.\d+)?)\s*(?:kcal|calories?|cals?)\b/gi, "")
+    .replace(/(\d+(?:\.\d+)?)\s*(?:g|grams?)\s*(?:of\s+)?(?:protein|carbs?|carbohydrates?|fat|fib(?:er|re))\b/gi, "")
+    .replace(/\(\s*\d+(?:\.\d+)?\s*(?:g|grams?)\s*\)/g, "")
+    .replace(/[,\s]+/g, " ").trim();
+  // Keep the name from before the leading amount is stripped, so an input
+  // like "1 bar (60g)" falls back to "1 bar" instead of the raw text.
+  const nameBeforeAmount = name;
+  name = name.replace(/^(\d+(?:\.\d+)?)\s*(?:g|grams?|cups?|tbsp|tsp|scoops?|bars?|slices?|pieces?)\s+/i, "").trim();
+  return { name: name || nameBeforeAmount || text.trim(), grams, amountText: text.trim(), stated };
+}
+
+/* ---------- Food databases ----------
+   Open Food Facts: free, no key. USDA: free key, optional.
+   Both return per-100g nutrition. Nothing is invented here. */
+async function searchOpenFoodFacts(query) {
+  const url = "https://world.openfoodfacts.org/cgi/search.pl?search_terms="
+    + encodeURIComponent(query) + "&json=1&page_size=5";
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.products || [])
+    .filter(p => p.nutriments && p.nutriments["energy-kcal_100g"] != null)
+    .map(p => ({
+      name: p.product_name || query,
+      source: "Open Food Facts",
+      per100: {
+        calories: p.nutriments["energy-kcal_100g"],
+        protein: p.nutriments.proteins_100g,
+        carbs: p.nutriments.carbohydrates_100g,
+        fat: p.nutriments.fat_100g,
+        fiber: p.nutriments.fiber_100g,
+      },
+      // Serving size in grams, when the product lists one.
+      servingGrams: servingToGrams(p.serving_size),
+    }));
+}
+
+function servingToGrams(serving) {
+  if (!serving) return null;
+  const m = String(serving).match(/(\d+(?:\.\d+)?)\s*g/i);
+  return m ? parseFloat(m[1]) : null;
+}
+
+async function lookupBarcode(code) {
+  const res = await fetch("https://world.openfoodfacts.org/api/v0/product/"
+    + encodeURIComponent(code) + ".json");
+  if (!res.ok) return null;
+  const data = await res.json();
+  if (data.status !== 1 || !data.product) return null;
+  const p = data.product, n = p.nutriments || {};
+  if (n["energy-kcal_100g"] == null) return null;
+  return {
+    name: p.product_name || ("Barcode " + code),
+    source: "Open Food Facts",
+    per100: {
+      calories: n["energy-kcal_100g"], protein: n.proteins_100g,
+      carbs: n.carbohydrates_100g, fat: n.fat_100g, fiber: n.fiber_100g,
+    },
+    servingGrams: servingToGrams(p.serving_size),
+  };
+}
+
+async function searchUSDA(query, key) {
+  const url = "https://api.nal.usda.gov/fdc/v1/foods/search?api_key="
+    + encodeURIComponent(key) + "&query=" + encodeURIComponent(query)
+    + "&pageSize=5&dataType=SR%20Legacy,Foundation,Branded";
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.foods || []).map(f => {
+    const byName = {};
+    (f.foodNutrients || []).forEach(n => { byName[n.nutrientName] = n.value; });
+    return {
+      name: f.description,
+      source: "USDA",
+      per100: {
+        calories: byName["Energy"], protein: byName["Protein"],
+        carbs: byName["Carbohydrate, by difference"],
+        fat: byName["Total lipid (fat)"], fiber: byName["Fiber, total dietary"],
+      },
+      servingGrams: null,
+    };
+  }).filter(f => f.per100.calories != null);
+}
+
+async function lookupCandidates(name) {
+  // Open Food Facts first (no key needed), then USDA if a key is saved.
+  // Returns a short list so she can pick the right match — never just the
+  // first result. Empty list means no match: the app says so.
+  const off = await searchOpenFoodFacts(name).catch(() => []);
+  const key = localStorage.getItem(KEY_KEY);
+  const usda = key ? await searchUSDA(name, key).catch(() => []) : [];
+  return off.concat(usda).slice(0, 6);
+}
+
+/* ---------- Scale per-100g values to the amount eaten ---------- */
+function scale(per100, grams) {
+  const out = {};
+  for (const k of ["calories", "protein", "carbs", "fat", "fiber"]) {
+    const v = per100[k];
+    out[k] = (v == null) ? null : Math.round(v * grams / 100 * 10) / 10;
+  }
+  return out;
+}
+
+/* ---------- Review flow: look up, show, then save ---------- */
+let reviewItem = null; // The item currently on the "check before it logs" screen.
+let reviewCandidates = []; // Database matches to pick from.
+let reviewParsed = null; // What she typed/said, parsed.
+
+const $ = id => document.getElementById(id);
+const statusEl = $("status");
+
+// Build a review item from one database match. Her stated numbers win.
+function buildReviewItem(match, parsed) {
+  const grams = (parsed && parsed.grams) || match.servingGrams || 100;
+  const item = {
+    name: match.name,
+    amountText: (parsed && parsed.amountText) || (match.servingGrams ? match.servingGrams + " g" : "100 g"),
+    grams, source: match.source,
+    sourceDetail: match.source + " — per 100 g, scaled to " + grams + " g",
+    ...scale(match.per100, grams),
+  };
+  if (parsed) {
+    for (const k of ["calories", "protein", "carbs", "fat", "fiber"]) {
+      if (parsed.stated[k] != null) {
+        item[k] = parsed.stated[k];
+        item.source = "You stated";
+        item.sourceDetail = "You stated these numbers — they win over the database.";
+      }
+    }
+  }
+  return item;
+}
+
+async function onLookup() {
+  const text = $("foodText").value.trim();
+  const barcode = $("barcode").value.trim();
+  if (!text && !barcode) { statusEl.textContent = "Say or type a food first."; return; }
+  statusEl.textContent = "Looking it up…";
+  $("lookupBtn").disabled = true;
+
+  reviewCandidates = [];
+  reviewParsed = text ? parseInput(text) : null;
+  let match = null;
+  if (barcode) match = await lookupBarcode(barcode);
+  if (match) reviewCandidates = [match];
+  else if (reviewParsed) reviewCandidates = await lookupCandidates(reviewParsed.name);
+  $("lookupBtn").disabled = false;
+
+  if (reviewCandidates.length) {
+    reviewItem = buildReviewItem(reviewCandidates[0], reviewParsed);
+    statusEl.textContent = "Found " + reviewCandidates.length + " match"
+      + (reviewCandidates.length > 1 ? "es" : "") + " — check it below.";
+  } else {
+    // No match: honest "I don't know", with blank numbers she can fill in
+    // from the label — or leave blank and skip.
+    reviewItem = {
+      name: (reviewParsed && reviewParsed.name) || ("Barcode " + barcode),
+      amountText: (reviewParsed && reviewParsed.amountText) || "",
+      grams: (reviewParsed && reviewParsed.grams) || null,
+      source: "unknown", sourceDetail: "",
+      calories: null, protein: null, carbs: null, fat: null, fiber: null,
+    };
+    if (reviewParsed) {
+      for (const k of ["calories", "protein", "carbs", "fat", "fiber"]) {
+        if (reviewParsed.stated[k] != null) {
+          reviewItem[k] = reviewParsed.stated[k];
+          reviewItem.source = "You stated";
+        }
+      }
+    }
+    statusEl.textContent = "No match in the databases — check it below.";
+  }
+  renderReview();
+}
+
+function numInput(id, value) {
+  return '<input type="number" step="any" min="0" id="' + id + '" value="'
+    + (value == null ? "" : value) + '" placeholder="—">';
+}
+
+function renderReview() {
+  const r = reviewItem;
+  const sec = $("reviewSection");
+  sec.classList.remove("hidden");
+  const unknown = r.source === "unknown";
+  let picker = "";
+  if (reviewCandidates.length > 1) {
+    picker = "<p><strong>Which one is it?</strong></p>";
+    reviewCandidates.forEach((c, i) => {
+      const kcal = c.per100.calories == null ? "—" : Math.round(c.per100.calories) + " kcal/100g";
+      picker += '<button type="button" class="secondary" data-cand="' + i + '"'
+        + (r.name === c.name && r.source === c.source ? ' style="border:2px solid #2e7d32"' : "")
+        + '>' + esc(c.name) + ' · ' + esc(c.source) + ' · ' + kcal + '</button> ';
+    });
+  }
+  $("reviewList").innerHTML = picker +
+    '<div class="card' + (unknown ? " unknown" : "") + '">' +
+    (unknown
+      ? "<p><strong>I don't know this one.</strong> No match in USDA or Open Food Facts. "
+        + "Fill in the numbers from the label, or cancel — nothing is guessed.</p>"
+      : "") +
+    '<label>Name</label><input type="text" id="revName" value="' + esc(r.name) + '">' +
+    '<label>Amount</label><input type="text" id="revAmount" value="' + esc(r.amountText) + '">' +
+    '<div class="row"><div><label>Grams</label>' + numInput("revGrams", r.grams) + '</div>' +
+    '<div><label>Calories</label>' + numInput("revCal", r.calories) + '</div>' +
+    '<div><label>Protein (g)</label>' + numInput("revPro", r.protein) + '</div></div>' +
+    '<div class="row"><div><label>Carbs (g)</label>' + numInput("revCarb", r.carbs) + '</div>' +
+    '<div><label>Fat (g)</label>' + numInput("revFat", r.fat) + '</div>' +
+    '<div><label>Fiber (g)</label>' + numInput("revFib", r.fiber) + '</div></div>' +
+    '<p class="source">Source: ' + esc(r.source)
+      + (r.sourceDetail ? " — " + esc(r.sourceDetail) : "") + '</p>' +
+    '</div>';
+  $("saveBtn").focus();
+}
+
+// Picking a different database match rebuilds the review from that match.
+$("reviewList").addEventListener("click", e => {
+  const idx = e.target.getAttribute("data-cand");
+  if (idx == null) return;
+  reviewItem = buildReviewItem(reviewCandidates[Number(idx)], reviewParsed);
+  renderReview();
+});
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+}
+
+function readNum(id) {
+  const v = $(id).value.trim();
+  return v === "" ? null : parseFloat(v);
+}
+
+let editingId = null; // When set, saving replaces that entry instead of adding one.
+
+$("saveBtn").addEventListener("click", () => {
+  let list = loadEntries();
+  if (editingId != null) list = list.filter(x => String(x.id) !== String(editingId));
+  editingId = null;
+  const source = reviewItem.source === "unknown"
+    ? ($("revCal").value.trim() ? "label" : "unknown") : reviewItem.source;
+  list.push({
+    id: Date.now(),
+    date: $("dayPicker").value || todayString(),
+    meal: $("meal").value,
+    name: $("revName").value.trim(),
+    amountText: $("revAmount").value.trim(),
+    grams: readNum("revGrams"),
+    calories: readNum("revCal"), protein: readNum("revPro"),
+    carbs: readNum("revCarb"), fat: readNum("revFat"), fiber: readNum("revFib"),
+    source, sourceDetail: reviewItem.sourceDetail,
+  });
+  saveEntries(list);
+  reviewItem = null;
+  $("reviewSection").classList.add("hidden");
+  $("foodText").value = ""; $("barcode").value = "";
+  statusEl.textContent = "Logged.";
+  renderDay();
+});
+
+$("cancelBtn").addEventListener("click", () => {
+  reviewItem = null;
+  editingId = null;
+  $("reviewSection").classList.add("hidden");
+  statusEl.textContent = "";
+});
+
+$("lookupBtn").addEventListener("click", onLookup);
+
+/* ---------- Voice input (Web Speech API, typed fallback) ---------- */
+const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (!Speech) {
+  $("micBtn").disabled = true;
+  $("micBtn").textContent = "🎤 Voice not supported here — type instead";
+} else {
+  $("micBtn").addEventListener("click", () => {
+    const rec = new Speech();
+    rec.lang = "en-US";
+    rec.interimResults = false;
+    $("micBtn").textContent = "🎤 Listening…";
+    rec.onresult = e => {
+      $("foodText").value = e.results[0][0].transcript;
+      $("micBtn").textContent = "🎤 Speak";
+      statusEl.textContent = "Heard: " + e.results[0][0].transcript;
+    };
+    rec.onerror = () => { $("micBtn").textContent = "🎤 Speak"; statusEl.textContent = "Didn't catch that — try typing."; };
+    rec.onend = () => { $("micBtn").textContent = "🎤 Speak"; };
+    rec.start();
+  });
+}
+
+/* ---------- Day view: totals vs targets, entries by meal ---------- */
+const MEALS = ["breakfast", "11am", "lunch", "3pm snack", "dinner", "extra"];
+
+function dayTotals(entries) {
+  const t = { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 };
+  entries.forEach(e => {
+    for (const k of Object.keys(t)) if (e[k] != null) t[k] += e[k];
+  });
+  for (const k of Object.keys(t)) t[k] = Math.round(t[k] * 10) / 10;
+  return t;
+}
+
+function renderDay() {
+  const date = $("dayPicker").value || todayString();
+  const entries = loadEntries().filter(e => e.date === date);
+  const t = dayTotals(entries);
+
+  $("totals").innerHTML =
+    totalCard("Calories", t.calories + " / " + TARGETS.calories[0] + "–" + TARGETS.calories[1]) +
+    totalCard("Protein", t.protein + " / " + TARGETS.protein + " g") +
+    totalCard("Carbs", t.carbs + " / " + TARGETS.carbs + " g") +
+    totalCard("Fat", t.fat + " / " + TARGETS.fat + " g") +
+    totalCard("Fiber", t.fiber + " / " + TARGETS.fiber + " g+") +
+    totalCard("Items", String(entries.length));
+
+  let html = "";
+  for (const meal of MEALS) {
+    const group = entries.filter(e => e.meal === meal);
+    if (!group.length) continue;
+    html += '<div class="meal-group"><h3>' + meal + '</h3>';
+    group.forEach(e => {
+      html += '<div class="entry"><div><strong>' + esc(e.name) + '</strong>'
+        + ' <span class="hint">' + esc(e.amountText) + '</span><br>'
+        + '<span class="source">Source: ' + esc(e.source) + '</span></div>'
+        + '<div class="nums">' + (e.calories == null ? "—" : e.calories + " kcal")
+        + '<br><span class="hint">' + (e.protein == null ? "—" : e.protein + " P")
+        + ' / ' + (e.carbs == null ? "—" : e.carbs + " C")
+        + ' / ' + (e.fat == null ? "—" : e.fat + " F") + '</span></div>'
+        + '<div><button class="secondary" data-edit="' + e.id + '">Edit</button> '
+        + '<button class="danger" data-del="' + e.id + '">Delete</button></div></div>';
+    });
+    html += '</div>';
+  }
+  $("entries").innerHTML = html || '<p class="hint">Nothing logged this day yet.</p>';
+}
+
+function totalCard(label, value) {
+  return '<div class="card"><div class="big">' + esc(value) + '</div><div>' + label + '</div></div>';
+}
+
+// Edit: load the entry back into the review form. Delete: confirm, then remove.
+$("entries").addEventListener("click", e => {
+  const del = e.target.getAttribute("data-del");
+  const edit = e.target.getAttribute("data-edit");
+  const list = loadEntries();
+  if (del) {
+    if (!confirm("Delete this entry?")) return;
+    saveEntries(list.filter(x => String(x.id) !== del));
+    renderDay();
+  } else if (edit) {
+    const item = list.find(x => String(x.id) === edit);
+    if (!item) return;
+    editingId = item.id;
+    reviewItem = { ...item, sourceDetail: item.sourceDetail || "" };
+    $("meal").value = item.meal;
+    renderReview();
+    window.scrollTo({ top: $("reviewSection").offsetTop, behavior: "smooth" });
+  }
+});
+
+/* ---------- Settings ---------- */
+$("usdaKey").value = localStorage.getItem(KEY_KEY) || "";
+$("saveKey").addEventListener("click", () => {
+  localStorage.setItem(KEY_KEY, $("usdaKey").value.trim());
+  statusEl.textContent = "Key saved in this browser.";
+});
+
+/* ---------- Start ---------- */
+$("dayPicker").value = todayString();
+$("dayPicker").addEventListener("change", renderDay);
+renderDay();
+</script>
+</body>
+</html>
