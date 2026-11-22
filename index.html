@@ -13,7 +13,7 @@
   h2 { font-size: 1.1rem; margin: 24px 0 8px; }
   .sub { color: #666; margin: 0 0 16px; }
   label { display: block; font-weight: 600; margin: 12px 0 4px; }
-  input[type="text"], input[type="number"], input[type="date"],
+  input[type="text"], input[type="number"], input[type="date"], input[type="password"],
   select, textarea {
     width: 100%; padding: 10px; font-size: 1rem;
     border: 1px solid #bbb; border-radius: 8px; }
@@ -45,25 +45,30 @@
 <body>
 
 <h1>JustTrackIt</h1>
-<p class="sub">Voice or type what you ate. Every number comes from a food database or from you — never guessed.</p>
+<p class="sub">Voice or type what you ate. An LLM understands it; every number comes from a food database or from you — never guessed.</p>
 
-<!-- Settings: USDA key is optional. Open Food Facts needs no key. -->
+<!-- Settings: both keys live only in this browser. Nothing is ever uploaded
+     or written into the code — no keys in any file, no demo keys, no .env. -->
 <details>
-  <summary>Settings — USDA API key (optional)</summary>
-  <label for="usdaKey">USDA FoodData Central API key</label>
-  <input type="text" id="usdaKey" placeholder="Paste your free key here">
+  <summary>Settings — API keys (stored only in this browser)</summary>
+  <label for="anthropicKey">Anthropic API key</label>
+  <input type="password" id="anthropicKey" placeholder="Paste your Anthropic key here" autocomplete="off">
+  <p class="hint">Needed for the LLM to interpret what you ate. Without it, the app falls back to simple pattern matching and says so. The key is sent only to Anthropic, straight from your browser — no middleman — and is stored only in this browser.</p>
+  <label for="usdaKey">USDA FoodData Central API key (optional)</label>
+  <input type="text" id="usdaKey" placeholder="Paste your free key here" autocomplete="off">
   <p class="hint">Free key from api.nal.usda.gov. Without a key, lookups use Open Food Facts only. The key is stored only in this browser.</p>
-  <button id="saveKey" class="secondary">Save key</button>
+  <button id="saveKeys" class="secondary">Save keys</button>
 </details>
 
 <!-- Log a food -->
 <h2>Log food</h2>
 <label for="foodText">What did you eat, and how much?</label>
-<textarea id="foodText" placeholder="e.g. 1 cup cooked red rice&#10;or: 1 protein bar, 230 calories, 18g protein"></textarea>
+<textarea id="foodText" placeholder="e.g. half a multigrain bagel&#10;or: 1 cup cooked red rice and a protein bar, 230 calories, 18g protein&#10;or: the usual lunch"></textarea>
 <div class="row">
   <div>
     <label for="meal">Meal</label>
     <select id="meal">
+      <option value="">— which meal? —</option>
       <option>breakfast</option>
       <option>11am</option>
       <option>lunch</option>
@@ -98,15 +103,31 @@
 <div class="totals" id="totals"></div>
 <div id="entries"></div>
 
+<!-- Audit: end of day, or on demand -->
+<div class="row">
+  <button id="auditBtn" type="button" class="secondary">Audit today</button>
+  <button id="howBtn" type="button" class="secondary">How am I doing?</button>
+</div>
+<section id="auditSection">
+  <div id="audit"></div>
+</section>
+<section id="suggestSection">
+  <div id="suggest"></div>
+</section>
+
 <script>
 "use strict";
 
 /* ---------- Targets (hers) ---------- */
 const TARGETS = { calories: [1850, 1900], carbs: 213, protein: 105, fat: 60, fiber: 25 };
+const PROTEIN_RANGE = [100, 110]; // Protein target band; 105 g is the aim.
 
 /* ---------- Storage (local only, no server) ---------- */
 const ENTRIES_KEY = "justtrackit.entries.v1";
-const KEY_KEY = "justtrackit.usdaKey.v1";
+const USDA_KEY = "justtrackit.usdaKey.v1";
+const ANTHROPIC_KEY = "justtrackit.anthropicKey.v1";
+// Keys live ONLY in localStorage on her device. They are never written into
+// any file, never committed, never sent anywhere except the API they belong to.
 
 function loadEntries() {
   try { return JSON.parse(localStorage.getItem(ENTRIES_KEY)) || []; }
@@ -121,7 +142,8 @@ function todayString() {
     + "-" + String(d.getDate()).padStart(2, "0");
 }
 
-/* ---------- Parse what she typed or said ----------
+/* ---------- Parse what she typed or said (v1 fallback) ----------
+   Used when no Anthropic key is set, or when the LLM call fails.
    Pulls out a food name, an amount, and any numbers she stated.
    Her stated numbers always win over the database. */
 function parseInput(text) {
@@ -233,7 +255,7 @@ async function lookupCandidates(name) {
   // Returns a short list so she can pick the right match — never just the
   // first result. Empty list means no match: the app says so.
   const off = await searchOpenFoodFacts(name).catch(() => []);
-  const key = localStorage.getItem(KEY_KEY);
+  const key = localStorage.getItem(USDA_KEY);
   const usda = key ? await searchUSDA(name, key).catch(() => []) : [];
   return off.concat(usda).slice(0, 6);
 }
@@ -248,22 +270,156 @@ function scale(per100, grams) {
   return out;
 }
 
-/* ---------- Review flow: look up, show, then save ---------- */
-let reviewItem = null; // The item currently on the "check before it logs" screen.
-let reviewCandidates = []; // Database matches to pick from.
-let reviewParsed = null; // What she typed/said, parsed.
+/* ---------- LLM interpretation layer (v2) ----------
+   The LLM interprets messy voice/text and decides WHAT to look up.
+   The lookup is the grounding: numbers come only from tool results,
+   never from the model's memory. The app — not the model — turns the
+   tool results into numbers, using the match id the model chose.
+   If no key is set, the app falls back to parseInput (v1) and says so. */
+const LLM_MODEL = "claude-sonnet-4-5";
+const LLM_URL = "https://api.anthropic.com/v1/messages";
 
+const LLM_SYSTEM = [
+  "You interpret messy food logs into structured items. Rules:",
+  "- You NEVER state a calorie or macro number from memory. Every number must come from a lookup tool result.",
+  "- For each food, call search_usda (generic foods: rice, dals, vegetables, bread) or search_open_food_facts (packaged or branded foods) or lookup_barcode (when a barcode is given). Pick the best match and remember its id.",
+  "- If she stated numbers herself (e.g. \"230 calories, 18g protein\"), keep them in \"stated\" — hers win over the database.",
+  "- If no tool returns a match for a food, use matchId null. The app will say it doesn't know.",
+  "- If the text refers to something only she knows (\"the usual lunch\", \"the same as yesterday\") and her past meals below don't resolve it, return items [] and a note asking what was in it.",
+  "- State any assumption plainly in amountText (e.g. \"half a ~100 g bagel, assumed\").",
+  "- meal: which meal this is, one of breakfast, 11am, lunch, 3pm snack, dinner, extra — or null if she didn't say.",
+  "- End with ONLY a JSON object, no other text:",
+  '{"meal":"lunch"|null,"items":[{"name":"...","amountText":"...","grams":number|null,"gramsAssumed":true|false,"matchId":"...|null","stated":{"calories":n,"protein":n,"carbs":n,"fat":n,"fiber":n}}],"note":"..."}',
+  "- grams: the amount eaten in grams when you can tell it (a whole bagel ~100 g, half ~50 g, 1 cup cooked rice ~200 g, 1 cup cooked dal ~200 g). Otherwise null.",
+  "- Omit any stated field she did not give.",
+].join("\n");
+
+const LLM_TOOLS = [
+  { name: "search_usda",
+    description: "Search USDA FoodData Central for a generic food. Returns matches with per-100g nutrition and an id for each. Only works when a USDA key is saved; if the tool says USDA is unavailable, use search_open_food_facts instead.",
+    input_schema: { type: "object", properties: { query: { type: "string", description: "Food to search for" } }, required: ["query"] } },
+  { name: "search_open_food_facts",
+    description: "Search Open Food Facts for a packaged or branded food. Returns matches with per-100g nutrition and an id for each.",
+    input_schema: { type: "object", properties: { query: { type: "string", description: "Food to search for" } }, required: ["query"] } },
+  { name: "lookup_barcode",
+    description: "Look up a packaged food by barcode in Open Food Facts. Returns the product with per-100g nutrition and an id.",
+    input_schema: { type: "object", properties: { code: { type: "string", description: "Barcode digits" } }, required: ["code"] } },
+];
+
+// Tool results the model chose from, kept by id so the app can turn them
+// into numbers itself. The model never hands the app a number.
+let toolCounter = 0;
+const toolResults = {}; // id -> match object {name, source, per100, servingGrams}
+
+function storeCandidates(list, prefix) {
+  return list.map(m => {
+    const id = prefix + "-" + (toolCounter++);
+    toolResults[id] = m;
+    return { id, name: m.name, source: m.source, per100: m.per100,
+             servingGrams: m.servingGrams == null ? null : m.servingGrams };
+  });
+}
+
+async function executeTool(name, input) {
+  if (name === "search_usda") {
+    const key = localStorage.getItem(USDA_KEY);
+    if (!key) return JSON.stringify({ error: "USDA key not set — use search_open_food_facts instead." });
+    const list = await searchUSDA(input.query, key).catch(() => []);
+    return JSON.stringify(storeCandidates(list, "usda"));
+  }
+  if (name === "search_open_food_facts") {
+    const list = await searchOpenFoodFacts(input.query).catch(() => []);
+    return JSON.stringify(storeCandidates(list, "off"));
+  }
+  if (name === "lookup_barcode") {
+    const m = await lookupBarcode(input.code).catch(() => null);
+    if (!m) return JSON.stringify({ error: "No product found for that barcode." });
+    return JSON.stringify(storeCandidates([m], "bar"));
+  }
+  return JSON.stringify({ error: "Unknown tool." });
+}
+
+async function callClaude(messages) {
+  const key = localStorage.getItem(ANTHROPIC_KEY);
+  const res = await fetch(LLM_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      // Lets the browser call the API directly. The key goes only to Anthropic.
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: LLM_MODEL, max_tokens: 2048, temperature: 0,
+      system: LLM_SYSTEM, tools: LLM_TOOLS, messages,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error("Claude API error " + res.status
+      + (res.status === 401 ? " — check the Anthropic key in Settings." : ""));
+  }
+  return res.json();
+}
+
+// Her past meals, from her own log — so "the usual" can resolve to what she
+// actually eats. Only the most common items per meal, kept short.
+function usualsSummary() {
+  const counts = {}; // meal|name -> {meal, name, amountText, n}
+  loadEntries().forEach(e => {
+    const k = e.meal + "|" + e.name;
+    const c = counts[k] || (counts[k] = { meal: e.meal, name: e.name, amountText: e.amountText, n: 0 });
+    c.n++;
+  });
+  const top = Object.values(counts).sort((a, b) => b.n - a.n).slice(0, 10);
+  if (!top.length) return "No past meals logged yet.";
+  return "Her past meals (most common first):\n"
+    + top.map(c => "- " + c.meal + ": " + c.name + " (" + c.amountText + ") x" + c.n).join("\n");
+}
+
+async function interpretWithLLM(text) {
+  const messages = [{ role: "user", content:
+    "Her past meals:\n" + usualsSummary() + "\n\nWhat she ate:\n" + text }];
+  for (let round = 0; round < 6; round++) {
+    const data = await callClaude(messages);
+    messages.push({ role: "assistant", content: data.content });
+    const toolCalls = data.content.filter(b => b.type === "tool_use");
+    if (!toolCalls.length) {
+      const textBlock = data.content.find(b => b.type === "text");
+      const raw = (textBlock ? textBlock.text : "").trim();
+      const start = raw.indexOf("{");
+      if (start < 0) throw new Error("LLM did not return JSON.");
+      return JSON.parse(raw.slice(start));
+    }
+    const results = [];
+    for (const tc of toolCalls) {
+      const out = await executeTool(tc.name, tc.input || {});
+      results.push({ type: "tool_result", tool_use_id: tc.id, content: out });
+    }
+    messages.push({ role: "user", content: results });
+  }
+  throw new Error("Too many lookup rounds — fell back to simple matching.");
+}
+
+/* ---------- Review flow: look up, show, then save ----------
+   The review holds a list of items (the LLM often finds several).
+   Nothing saves until she taps "Log it". */
+let reviewItems = []; // Items on the "check before it logs" screen.
 const $ = id => document.getElementById(id);
 const statusEl = $("status");
 
 // Build a review item from one database match. Her stated numbers win.
+// The source line says plainly where every number came from — and when an
+// amount was assumed instead of stated, it says that too.
 function buildReviewItem(match, parsed) {
   const grams = (parsed && parsed.grams) || match.servingGrams || 100;
+  const assumed = !parsed || parsed.grams == null || parsed.gramsAssumed;
   const item = {
     name: match.name,
     amountText: (parsed && parsed.amountText) || (match.servingGrams ? match.servingGrams + " g" : "100 g"),
     grams, source: match.source,
-    sourceDetail: match.source + " — per 100 g, scaled to " + grams + " g",
+    sourceDetail: match.source + " — per 100 g, scaled to " + grams + " g"
+      + (assumed ? " (amount assumed from a standard serving — check it)" : ""),
     ...scale(match.per100, grams),
   };
   if (parsed) {
@@ -278,46 +434,114 @@ function buildReviewItem(match, parsed) {
   return item;
 }
 
+// An item the databases don't know: blank numbers for her to fill in
+// from the label — or leave blank and skip. Nothing is guessed.
+function unknownItem(parsed, barcode) {
+  const item = {
+    name: (parsed && parsed.name) || ("Barcode " + barcode),
+    amountText: (parsed && parsed.amountText) || "",
+    grams: (parsed && parsed.grams) || null,
+    source: "unknown", sourceDetail: "",
+    calories: null, protein: null, carbs: null, fat: null, fiber: null,
+  };
+  if (parsed) {
+    for (const k of ["calories", "protein", "carbs", "fat", "fiber"]) {
+      if (parsed.stated[k] != null) {
+        item[k] = parsed.stated[k];
+        item.source = "You stated";
+      }
+    }
+  }
+  return item;
+}
+
+// Meal named in plain words ("for lunch", "at breakfast")? The fallback
+// path uses this; the LLM returns the meal itself.
+function mealFromText(text) {
+  const t = text.toLowerCase();
+  if (/\b11\s?am\b/.test(t)) return "11am";
+  if (/\b3\s?pm\b/.test(t)) return "3pm snack";
+  if (/\bbreakfast\b/.test(t)) return "breakfast";
+  if (/\blunch\b/.test(t)) return "lunch";
+  if (/\bdinner\b/.test(t)) return "dinner";
+  if (/\bsnack\b/.test(t)) return "3pm snack";
+  return null;
+}
+
+// Set the meal picker from what she said — or leave it blank so the app
+// ASKS instead of silently filing the entry under "extra".
+function setMealOrAsk(meal) {
+  $("meal").value = meal || "";
+}
+
+// Build review items from the LLM's answer. Numbers come from the stored
+// tool results the model chose (by id) — never from the model's own text.
+function itemsFromLLM(out) {
+  return (out.items || []).map(it => {
+    const match = it.matchId ? toolResults[it.matchId] : null;
+    const parsed = { grams: it.grams, gramsAssumed: !!it.gramsAssumed,
+                     amountText: it.amountText, stated: it.stated || {} };
+    if (!match) return unknownItem({ name: it.name, ...parsed }, "");
+    const item = buildReviewItem(match, parsed);
+    item.name = it.name || match.name; // Her words for the food, database numbers.
+    return item;
+  });
+}
+
 async function onLookup() {
   const text = $("foodText").value.trim();
   const barcode = $("barcode").value.trim();
   if (!text && !barcode) { statusEl.textContent = "Say or type a food first."; return; }
   statusEl.textContent = "Looking it up…";
   $("lookupBtn").disabled = true;
+  reviewItems = [];
 
-  reviewCandidates = [];
-  reviewParsed = text ? parseInput(text) : null;
-  let match = null;
-  if (barcode) match = await lookupBarcode(barcode);
-  if (match) reviewCandidates = [match];
-  else if (reviewParsed) reviewCandidates = await lookupCandidates(reviewParsed.name);
-  $("lookupBtn").disabled = false;
-
-  if (reviewCandidates.length) {
-    reviewItem = buildReviewItem(reviewCandidates[0], reviewParsed);
-    statusEl.textContent = "Found " + reviewCandidates.length + " match"
-      + (reviewCandidates.length > 1 ? "es" : "") + " — check it below.";
-  } else {
-    // No match: honest "I don't know", with blank numbers she can fill in
-    // from the label — or leave blank and skip.
-    reviewItem = {
-      name: (reviewParsed && reviewParsed.name) || ("Barcode " + barcode),
-      amountText: (reviewParsed && reviewParsed.amountText) || "",
-      grams: (reviewParsed && reviewParsed.grams) || null,
-      source: "unknown", sourceDetail: "",
-      calories: null, protein: null, carbs: null, fat: null, fiber: null,
-    };
-    if (reviewParsed) {
-      for (const k of ["calories", "protein", "carbs", "fat", "fiber"]) {
-        if (reviewParsed.stated[k] != null) {
-          reviewItem[k] = reviewParsed.stated[k];
-          reviewItem.source = "You stated";
-        }
+  if (barcode) {
+    // Barcode path: one match, no interpretation needed.
+    const match = await lookupBarcode(barcode);
+    reviewItems = match ? [buildReviewItem(match, null)] : [unknownItem(null, barcode)];
+    setMealOrAsk(mealFromText(text));
+    statusEl.textContent = match ? "Found it — check below." : "No match for that barcode — check below.";
+  } else if (localStorage.getItem(ANTHROPIC_KEY)) {
+    // LLM path: interpret, then ground every number in a lookup.
+    statusEl.textContent = "Asking the LLM to interpret…";
+    try {
+      const out = await interpretWithLLM(text);
+      setMealOrAsk(out.meal || null);
+      reviewItems = itemsFromLLM(out);
+      if (!reviewItems.length) {
+        statusEl.textContent = out.note || "I need more detail — what was in it?";
+      } else {
+        statusEl.textContent = "LLM interpreted it — numbers from the databases. Check below.";
       }
+    } catch (err) {
+      // LLM failed: fall back to simple matching, and say so plainly.
+      statusEl.textContent = "LLM call failed (" + err.message + ") — used simple matching instead.";
+      await fallbackLookup(text);
     }
-    statusEl.textContent = "No match in the databases — check it below.";
+  } else {
+    // No Anthropic key: v1 simple matching, said plainly.
+    await fallbackLookup(text);
+    statusEl.textContent += " (Simple matching — add an Anthropic key in Settings for the LLM to interpret.)";
   }
+  $("lookupBtn").disabled = false;
   renderReview();
+}
+
+async function fallbackLookup(text) {
+  const parsed = parseInput(text);
+  setMealOrAsk(mealFromText(text));
+  const candidates = await lookupCandidates(parsed.name);
+  if (candidates.length) {
+    const item = buildReviewItem(candidates[0], parsed);
+    item.candidates = candidates;
+    reviewItems = [item];
+    statusEl.textContent = "Found " + candidates.length + " match"
+      + (candidates.length > 1 ? "es" : "") + " — check below.";
+  } else {
+    reviewItems = [unknownItem(parsed, "")];
+    statusEl.textContent = "No match in the databases — check below.";
+  }
 }
 
 function numInput(id, value) {
@@ -326,45 +550,55 @@ function numInput(id, value) {
 }
 
 function renderReview() {
-  const r = reviewItem;
   const sec = $("reviewSection");
+  if (!reviewItems.length) { sec.classList.add("hidden"); return; }
   sec.classList.remove("hidden");
-  const unknown = r.source === "unknown";
-  let picker = "";
-  if (reviewCandidates.length > 1) {
-    picker = "<p><strong>Which one is it?</strong></p>";
-    reviewCandidates.forEach((c, i) => {
-      const kcal = c.per100.calories == null ? "—" : Math.round(c.per100.calories) + " kcal/100g";
-      picker += '<button type="button" class="secondary" data-cand="' + i + '"'
-        + (r.name === c.name && r.source === c.source ? ' style="border:2px solid #2e7d32"' : "")
-        + '>' + esc(c.name) + ' · ' + esc(c.source) + ' · ' + kcal + '</button> ';
-    });
-  }
-  $("reviewList").innerHTML = picker +
-    '<div class="card' + (unknown ? " unknown" : "") + '">' +
-    (unknown
-      ? "<p><strong>I don't know this one.</strong> No match in USDA or Open Food Facts. "
-        + "Fill in the numbers from the label, or cancel — nothing is guessed.</p>"
-      : "") +
-    '<label>Name</label><input type="text" id="revName" value="' + esc(r.name) + '">' +
-    '<label>Amount</label><input type="text" id="revAmount" value="' + esc(r.amountText) + '">' +
-    '<div class="row"><div><label>Grams</label>' + numInput("revGrams", r.grams) + '</div>' +
-    '<div><label>Calories</label>' + numInput("revCal", r.calories) + '</div>' +
-    '<div><label>Protein (g)</label>' + numInput("revPro", r.protein) + '</div></div>' +
-    '<div class="row"><div><label>Carbs (g)</label>' + numInput("revCarb", r.carbs) + '</div>' +
-    '<div><label>Fat (g)</label>' + numInput("revFat", r.fat) + '</div>' +
-    '<div><label>Fiber (g)</label>' + numInput("revFib", r.fiber) + '</div></div>' +
-    '<p class="source">Source: ' + esc(r.source)
-      + (r.sourceDetail ? " — " + esc(r.sourceDetail) : "") + '</p>' +
-    '</div>';
+  let html = "";
+  reviewItems.forEach((r, i) => {
+    const unknown = r.source === "unknown";
+    let picker = "";
+    if (r.candidates && r.candidates.length > 1) {
+      picker = "<p><strong>Which one is it?</strong></p>";
+      r.candidates.forEach((c, j) => {
+        const kcal = c.per100.calories == null ? "—" : Math.round(c.per100.calories) + " kcal/100g";
+        picker += '<button type="button" class="secondary" data-item="' + i + '" data-cand="' + j + '"'
+          + (r.name === c.name && r.source === c.source ? ' style="border:2px solid #2e7d32"' : "")
+          + '>' + esc(c.name) + ' · ' + esc(c.source) + ' · ' + kcal + '</button> ';
+      });
+    }
+    html += picker +
+      '<div class="card' + (unknown ? " unknown" : "") + '">' +
+      (unknown
+        ? "<p><strong>I don't know this one.</strong> No match in USDA or Open Food Facts. "
+          + "Fill in the numbers from the label, or cancel — nothing is guessed.</p>"
+        : "") +
+      '<label>Name</label><input type="text" id="revName-' + i + '" value="' + esc(r.name) + '">' +
+      '<label>Amount</label><input type="text" id="revAmount-' + i + '" value="' + esc(r.amountText) + '">' +
+      '<div class="row"><div><label>Grams</label>' + numInput("revGrams-" + i, r.grams) + '</div>' +
+      '<div><label>Calories</label>' + numInput("revCal-" + i, r.calories) + '</div>' +
+      '<div><label>Protein (g)</label>' + numInput("revPro-" + i, r.protein) + '</div></div>' +
+      '<div class="row"><div><label>Carbs (g)</label>' + numInput("revCarb-" + i, r.carbs) + '</div>' +
+      '<div><label>Fat (g)</label>' + numInput("revFat-" + i, r.fat) + '</div>' +
+      '<div><label>Fiber (g)</label>' + numInput("revFib-" + i, r.fiber) + '</div></div>' +
+      '<p class="source">Source: ' + esc(r.source)
+        + (r.sourceDetail ? " — " + esc(r.sourceDetail) : "") + '</p>' +
+      '</div>';
+  });
+  $("reviewList").innerHTML = html;
   $("saveBtn").focus();
 }
 
-// Picking a different database match rebuilds the review from that match.
+// Picking a different database match rebuilds that item from that match.
 $("reviewList").addEventListener("click", e => {
   const idx = e.target.getAttribute("data-cand");
-  if (idx == null) return;
-  reviewItem = buildReviewItem(reviewCandidates[Number(idx)], reviewParsed);
+  const itemIdx = e.target.getAttribute("data-item");
+  if (idx == null || itemIdx == null) return;
+  const item = reviewItems[Number(itemIdx)];
+  if (!item || !item.candidates) return;
+  const parsed = { grams: item.grams, amountText: item.amountText, stated: {} };
+  const next = buildReviewItem(item.candidates[Number(idx)], parsed);
+  next.candidates = item.candidates;
+  reviewItems[Number(itemIdx)] = next;
   renderReview();
 });
 
@@ -374,31 +608,41 @@ function esc(s) {
 }
 
 function readNum(id) {
-  const v = $(id).value.trim();
+  const el = $(id);
+  if (!el) return null;
+  const v = el.value.trim();
   return v === "" ? null : parseFloat(v);
 }
 
 let editingId = null; // When set, saving replaces that entry instead of adding one.
 
 $("saveBtn").addEventListener("click", () => {
+  // No meal named? Ask — never silently file under "extra".
+  if (!$("meal").value) {
+    statusEl.textContent = "Which meal was this? Pick one above first.";
+    $("meal").focus();
+    return;
+  }
   let list = loadEntries();
   if (editingId != null) list = list.filter(x => String(x.id) !== String(editingId));
   editingId = null;
-  const source = reviewItem.source === "unknown"
-    ? ($("revCal").value.trim() ? "label" : "unknown") : reviewItem.source;
-  list.push({
-    id: Date.now(),
-    date: $("dayPicker").value || todayString(),
-    meal: $("meal").value,
-    name: $("revName").value.trim(),
-    amountText: $("revAmount").value.trim(),
-    grams: readNum("revGrams"),
-    calories: readNum("revCal"), protein: readNum("revPro"),
-    carbs: readNum("revCarb"), fat: readNum("revFat"), fiber: readNum("revFib"),
-    source, sourceDetail: reviewItem.sourceDetail,
+  const date = $("dayPicker").value || todayString();
+  reviewItems.forEach((r, i) => {
+    const source = r.source === "unknown"
+      ? ($("revCal-" + i).value.trim() ? "label" : "unknown") : r.source;
+    list.push({
+      id: Date.now() + i,
+      date, meal: $("meal").value,
+      name: $("revName-" + i).value.trim(),
+      amountText: $("revAmount-" + i).value.trim(),
+      grams: readNum("revGrams-" + i),
+      calories: readNum("revCal-" + i), protein: readNum("revPro-" + i),
+      carbs: readNum("revCarb-" + i), fat: readNum("revFat-" + i), fiber: readNum("revFib-" + i),
+      source, sourceDetail: r.sourceDetail,
+    });
   });
   saveEntries(list);
-  reviewItem = null;
+  reviewItems = [];
   $("reviewSection").classList.add("hidden");
   $("foodText").value = ""; $("barcode").value = "";
   statusEl.textContent = "Logged.";
@@ -406,7 +650,7 @@ $("saveBtn").addEventListener("click", () => {
 });
 
 $("cancelBtn").addEventListener("click", () => {
-  reviewItem = null;
+  reviewItems = [];
   editingId = null;
   $("reviewSection").classList.add("hidden");
   statusEl.textContent = "";
@@ -480,6 +724,9 @@ function renderDay() {
     html += '</div>';
   }
   $("entries").innerHTML = html || '<p class="hint">Nothing logged this day yet.</p>';
+
+  // End of day: show the audit on its own after 8 pm.
+  if (date === todayString() && new Date().getHours() >= 20) renderAudit();
 }
 
 function totalCard(label, value) {
@@ -499,18 +746,132 @@ $("entries").addEventListener("click", e => {
     const item = list.find(x => String(x.id) === edit);
     if (!item) return;
     editingId = item.id;
-    reviewItem = { ...item, sourceDetail: item.sourceDetail || "" };
+    reviewItems = [{ ...item, sourceDetail: item.sourceDetail || "", candidates: [] }];
     $("meal").value = item.meal;
     renderReview();
     window.scrollTo({ top: $("reviewSection").offsetTop, behavior: "smooth" });
   }
 });
 
+/* ---------- Daily audit ----------
+   The day against her goals, plainly: what was met, what was missed,
+   with the numbers. Bands, not exact hits — a day is a band. */
+function auditLines(t) {
+  const lines = [];
+  lines.push({ label: "Calories", met: t.calories >= TARGETS.calories[0] && t.calories <= TARGETS.calories[1],
+    text: t.calories + " kcal vs " + TARGETS.calories[0] + "–" + TARGETS.calories[1],
+    delta: t.calories < TARGETS.calories[0] ? "short by " + Math.round(TARGETS.calories[0] - t.calories) + " kcal"
+      : t.calories > TARGETS.calories[1] ? "over by " + Math.round(t.calories - TARGETS.calories[1]) + " kcal" : "in range" });
+  lines.push({ label: "Protein", met: t.protein >= PROTEIN_RANGE[0] && t.protein <= PROTEIN_RANGE[1],
+    text: t.protein + " g vs " + TARGETS.protein + " g (" + PROTEIN_RANGE[0] + "–" + PROTEIN_RANGE[1] + ")",
+    delta: t.protein < PROTEIN_RANGE[0] ? "short by " + Math.round(PROTEIN_RANGE[0] - t.protein) + " g"
+      : t.protein > PROTEIN_RANGE[1] ? "over by " + Math.round(t.protein - PROTEIN_RANGE[1]) + " g" : "in range" });
+  lines.push({ label: "Carbs", met: t.carbs >= 190 && t.carbs <= 235,
+    text: t.carbs + " g vs " + TARGETS.carbs + " g",
+    delta: t.carbs < 190 ? "short by " + Math.round(190 - t.carbs) + " g"
+      : t.carbs > 235 ? "over by " + Math.round(t.carbs - 235) + " g" : "in range" });
+  lines.push({ label: "Fat", met: t.fat >= 54 && t.fat <= 66,
+    text: t.fat + " g vs " + TARGETS.fat + " g",
+    delta: t.fat < 54 ? "short by " + Math.round(54 - t.fat) + " g"
+      : t.fat > 66 ? "over by " + Math.round(t.fat - 66) + " g" : "in range" });
+  lines.push({ label: "Fiber", met: t.fiber >= TARGETS.fiber,
+    text: t.fiber + " g vs " + TARGETS.fiber + " g+",
+    delta: t.fiber < TARGETS.fiber ? "short by " + Math.round(TARGETS.fiber - t.fiber) + " g" : "met" });
+  return lines;
+}
+
+function renderAudit() {
+  const date = $("dayPicker").value || todayString();
+  const t = dayTotals(loadEntries().filter(e => e.date === date));
+  const lines = auditLines(t);
+  const met = lines.filter(l => l.met).length;
+  $("audit").innerHTML = "<h2>Audit — " + date + "</h2>"
+    + "<p><strong>" + met + " of " + lines.length + " on target.</strong></p>"
+    + lines.map(l => '<div class="card"><strong>' + (l.met ? "✓ " : "✗ ") + l.label
+      + '</strong> — ' + esc(l.text) + ' (' + esc(l.delta) + ')</div>').join("");
+}
+
+$("auditBtn").addEventListener("click", renderAudit);
+
+/* ---------- Mid-day suggestions ----------
+   "How am I doing?" — if protein or fiber is tracking short, or calories
+   are drifting over, suggest concrete foods to close the gap.
+   Staples are hers, and the rules are hers: fully vegetarian, no eggs,
+   no avocado, no soy chunks / meal maker, nonfat yogurt only, no cheese.
+   Every number comes from a live database lookup — never invented. */
+const STAPLES = [
+  { query: "Greek yogurt nonfat", amount: "170 g", grams: 170, helps: ["protein"] },
+  { query: "tofu", amount: "150 g", grams: 150, helps: ["protein"] },
+  { query: "moong dal cooked", amount: "1 cup (200 g)", grams: 200, helps: ["protein", "fiber"] },
+  { query: "chickpeas cooked", amount: "½ cup (80 g)", grams: 80, helps: ["protein", "fiber"] },
+  { query: "almonds raw", amount: "15 (15 g)", grams: 15, helps: ["protein", "fiber"] },
+  { query: "apple raw", amount: "1 medium (180 g)", grams: 180, helps: ["fiber"] },
+];
+
+async function suggest() {
+  const box = $("suggest");
+  const date = $("dayPicker").value || todayString();
+  const t = dayTotals(loadEntries().filter(e => e.date === date));
+  const proteinGap = Math.max(0, TARGETS.protein - t.protein);
+  const fiberGap = Math.max(0, TARGETS.fiber - t.fiber);
+  const headroom = TARGETS.calories[1] - t.calories;
+
+  if (proteinGap < 5 && fiberGap < 2) {
+    box.innerHTML = "<h2>How am I doing?</h2><p>On track — protein " + t.protein
+      + " g, fiber " + t.fiber + " g, " + t.calories + " kcal. Nothing to close right now.</p>";
+    return;
+  }
+  box.innerHTML = "<h2>How am I doing?</h2><p>Checking the databases for gap-closers…</p>";
+
+  // Rank staples by the gap they help most; fiber grams are smaller numbers,
+  // so they count triple in the ranking.
+  const ranked = STAPLES.slice().sort((a, b) => {
+    const score = s => (s.helps.includes("protein") ? proteinGap : 0)
+      + (s.helps.includes("fiber") ? fiberGap * 3 : 0);
+    return score(b) - score(a);
+  });
+  const picked = [];
+  for (const s of ranked) {
+    if (picked.length >= 3) break;
+    const cands = await lookupCandidates(s.query).catch(() => []);
+    if (!cands.length) continue; // No lookup, no suggestion — never guess numbers.
+    const m = cands[0];
+    picked.push({ staple: s, match: m, nums: scale(m.per100, s.grams) });
+  }
+  if (headroom < 0) picked.sort((a, b) => (a.nums.calories || 0) - (b.nums.calories || 0));
+
+  let html = "<h2>How am I doing?</h2><p>Protein " + t.protein + " g (aim " + TARGETS.protein
+    + "), fiber " + t.fiber + " g (aim " + TARGETS.fiber + "+), " + t.calories + " kcal."
+    + (proteinGap >= 5 ? " Short on protein by ~" + Math.round(proteinGap) + " g." : "")
+    + (fiberGap >= 2 ? " Short on fiber by ~" + Math.round(fiberGap) + " g." : "")
+    + (headroom < 0 ? " Already over on calories, so these are the lightest options." : "")
+    + "</p>";
+  picked.forEach(p => {
+    const closes = [];
+    if (p.nums.protein != null && proteinGap >= 5)
+      closes.push("closes ~" + Math.round(p.nums.protein) + " g of your protein gap");
+    if (p.nums.fiber != null && fiberGap >= 2)
+      closes.push("closes ~" + Math.round(p.nums.fiber) + " g of your fiber gap");
+    html += '<div class="card"><strong>' + esc(p.match.name) + '</strong> — ' + esc(p.staple.amount)
+      + '<br>' + (p.nums.calories == null ? "—" : Math.round(p.nums.calories) + " kcal")
+      + ' · ' + (p.nums.protein == null ? "—" : p.nums.protein + " P")
+      + ' / ' + (p.nums.carbs == null ? "—" : p.nums.carbs + " C")
+      + ' / ' + (p.nums.fat == null ? "—" : p.nums.fat + " F")
+      + ' / fiber ' + (p.nums.fiber == null ? "—" : p.nums.fiber + " g")
+      + '<br><span class="source">' + esc(p.match.source) + (closes.length ? " — " + closes.join(", ") : "") + '</span></div>';
+  });
+  box.innerHTML = html;
+}
+
+$("howBtn").addEventListener("click", suggest);
+
 /* ---------- Settings ---------- */
-$("usdaKey").value = localStorage.getItem(KEY_KEY) || "";
-$("saveKey").addEventListener("click", () => {
-  localStorage.setItem(KEY_KEY, $("usdaKey").value.trim());
-  statusEl.textContent = "Key saved in this browser.";
+$("anthropicKey").value = localStorage.getItem(ANTHROPIC_KEY) || "";
+$("usdaKey").value = localStorage.getItem(USDA_KEY) || "";
+$("saveKeys").addEventListener("click", () => {
+  localStorage.setItem(ANTHROPIC_KEY, $("anthropicKey").value.trim());
+  localStorage.setItem(USDA_KEY, $("usdaKey").value.trim());
+  statusEl.textContent = "Keys saved in this browser only.";
 });
 
 /* ---------- Start ---------- */
