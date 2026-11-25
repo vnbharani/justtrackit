@@ -5,12 +5,15 @@ I built this to log my food by voice or text without any number being guessed. A
 ## How it works
 
 1. Tap the mic and say what you ate, or type it. Messy is fine: "1 cup cooked red rice and a protein bar, 230 calories, 18g protein".
-2. The LLM interprets it: it pulls out each food, the amount, and any numbers I stated — and decides what to look up for each one.
-3. It calls the lookup tools for every number: USDA FoodData Central for generic foods, Open Food Facts for packaged and branded foods (plus barcode). The app turns the lookup results into numbers itself — the model never outputs a calorie from memory.
-4. I get a **Check before it logs** screen: each food with its numbers and its source (USDA / Open Food Facts / Label / You stated). If a food has no match, the app says "I don't know this one" and leaves the numbers blank for me to fill in from the label. It never invents a value.
-5. If I stated a number myself, mine wins over the database.
-6. If I didn't name a meal, the app asks which meal it was instead of silently filing it under "extra".
+2. The LLM interprets it: it pulls out each food, the amount, and any numbers I stated — and decides what to look up for each one. It also figures out the meal from the time and the size of the meal: 8 am–12 pm is breakfast (brunch on a weekend), 12–4 pm lunch, 4 pm onwards dinner. If the meal is much smaller than a main meal, it asks if it's a snack.
+3. It calls the lookup tools for every number — three at a time, in parallel: USDA FoodData Central for generic foods, Open Food Facts for packaged and branded foods (plus barcode). The app turns the lookup results into numbers itself — the model never outputs a calorie from memory.
+4. If a dish has no match (bendakaya fry, say), the app works out what the dish is, shows its closest find, breaks it into ingredients and looks each one up.
+5. I get a **Check before it logs** screen: each food with its numbers and its source (USDA / Open Food Facts / Label / You stated). It shows what's being logged — yes, no, or send a note with what to change. If I don't reply in 60 seconds, it logs as shown. If a food has no match, the app says "I don't know this one" and leaves the numbers blank for me to fill in from the label. It never invents a value.
+6. If I stated a number myself, mine wins over the database.
 7. "The usual" works because the app remembers my past meals from my own log and the LLM can match against them.
+8. If a lookup times out, it tries twice, then says so plainly and queues the item to retry later. If the retry fails twice too, it says it has failed and asks me for the exact numbers — or I can use **Fast log**: give the macros and the calories are worked out from them, or give the calories and the macros are estimated from my target split (stated plainly).
+
+The concepts behind all of this — tool use, RAG, workflows, grounding, failure handling — are written up in [CONCEPTS.md](CONCEPTS.md).
 
 ## Where the numbers come from
 
@@ -38,4 +41,4 @@ No keys are ever in the code — whoever downloads the app provides their own ke
 - Entries live in the browser's localStorage on my device — there is no server and nothing is uploaded.
 - Voice input uses the browser's speech recognition; where it isn't supported, typing works the same way.
 - No sync to any other app in this version — the diary lives here.
-- v1 used plain pattern matching and no LLM. v2 added the LLM interpretation layer — the LLM interprets, the lookup grounds.
+- v1 used plain pattern matching and no LLM. v2 added the LLM interpretation layer — the LLM interprets, the lookup grounds. v3 added time-aware meal inference, three parallel lookups, the dish-to-ingredients fallback, the review screen that logs on silence, retry-twice with a retry queue, fast log, and snack alerts. See [CONCEPTS.md](CONCEPTS.md) for the thinking behind each piece.

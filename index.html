@@ -39,13 +39,16 @@
   .entry input { width: 64px; padding: 4px; }
   .hint { font-size: 0.85rem; color: #666; }
   .hidden { display: none; }
+  .countdown { font-weight: 700; color: #2e7d32; }
+  .snack-note { background: #e8f5e9; border-color: #81c784; }
+  .pending { background: #fff8e1; border-color: #e6c200; }
   #status { min-height: 1.2em; color: #555; margin-top: 8px; }
 </style>
 </head>
 <body>
 
 <h1>JustTrackIt</h1>
-<p class="sub">Voice or type what you ate. An LLM understands it; every number comes from a food database or from you — never guessed.</p>
+<p class="sub">Voice or type what you ate. An LLM understands it; every number comes from a food database or from you — never guessed. v3: it figures out the meal from the time, looks things up three at a time, and logs what it shows you unless you say otherwise.</p>
 
 <!-- Settings: both keys live only in this browser. Nothing is ever uploaded
      or written into the code — no keys in any file, no demo keys, no .env. -->
@@ -91,9 +94,49 @@
 <!-- Review before anything is saved -->
 <section id="reviewSection" class="hidden">
   <h2>Check before it logs</h2>
+  <p id="countdown" class="countdown hidden"></p>
+  <p class="hint">This is what's being logged. Say yes, or send a note with what to change — if you don't reply, it logs as shown.</p>
+  <div id="snackAsk" class="hidden"></div>
   <div id="reviewList"></div>
   <button id="saveBtn" type="button">Log it</button>
   <button id="cancelBtn" type="button" class="secondary">Cancel</button>
+</section>
+
+<!-- Fast log: when the lookup can't find it and you want it fast -->
+<section id="fastLogSection">
+  <h2>Fast log</h2>
+  <p class="hint">Skip the lookup — give the macros and calories are worked out from them (protein × 4 + carbs × 4 + fat × 9). Or give the calories and the macros are estimated from your target split (213 C / 105 P / 60 F) — it says so plainly.</p>
+  <label for="fastName">Food</label>
+  <input type="text" id="fastName" placeholder="e.g. bendakaya fry">
+  <div class="row">
+    <div><label for="fastMeal">Meal</label>
+      <select id="fastMeal">
+        <option>breakfast</option>
+        <option>11am</option>
+        <option>lunch</option>
+        <option>3pm snack</option>
+        <option selected>dinner</option>
+        <option>extra</option>
+      </select>
+    </div>
+    <div><label for="fastAmount">Amount</label>
+      <input type="text" id="fastAmount" placeholder="e.g. 1 cup">
+    </div>
+  </div>
+  <div class="row">
+    <div><label for="fastCal">Calories</label><input type="number" id="fastCal" min="0" step="any" placeholder="—"></div>
+    <div><label for="fastPro">Protein (g)</label><input type="number" id="fastPro" min="0" step="any" placeholder="—"></div>
+    <div><label for="fastCarb">Carbs (g)</label><input type="number" id="fastCarb" min="0" step="any" placeholder="—"></div>
+    <div><label for="fastFat">Fat (g)</label><input type="number" id="fastFat" min="0" step="any" placeholder="—"></div>
+  </div>
+  <button id="fastLogBtn" type="button">Fast log it</button>
+  <p id="fastStatus" class="hint"></p>
+</section>
+
+<!-- Lookups that timed out and are waiting to be retried -->
+<section id="pendingSection" class="hidden">
+  <h2>Waiting to retry</h2>
+  <div id="pendingList"></div>
 </section>
 
 <!-- Day view -->
@@ -142,6 +185,45 @@ function todayString() {
     + "-" + String(d.getDate()).padStart(2, "0");
 }
 
+/* ---------- Fetch with retry (v3) ----------
+   Time out and retry: every lookup tries twice before giving up.
+   A lookup that fails twice is not retried silently in a loop — it goes
+   to the pending queue, and the app says so plainly. */
+async function fetchWithRetry(url, options, attempts) {
+  let lastErr = null;
+  for (let i = 0; i < (attempts || 2); i++) {
+    try {
+      const res = await fetch(url, options);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (i < (attempts || 2) - 1) await new Promise(r => setTimeout(r, 800 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+/* ---------- Pending retry queue (v3) ----------
+   Lookups that timed out twice get queued here and retried later —
+   automatically the next time the app opens, or with the Retry button.
+   If the retry fails twice again, the app says it's failed and asks her
+   for the exact numbers (fast log). Nothing is retried forever. */
+const PENDING_KEY = "justtrackit.pending.v1";
+function loadPending() {
+  try { return JSON.parse(localStorage.getItem(PENDING_KEY)) || []; }
+  catch (e) { return []; }
+}
+function savePending(list) {
+  localStorage.setItem(PENDING_KEY, JSON.stringify(list));
+}
+function queuePending(text, meal) {
+  const list = loadPending();
+  list.push({ id: Date.now(), text, meal: meal || "", tries: 0, addedAt: todayString() });
+  savePending(list);
+  renderPending();
+}
+
 /* ---------- Parse what she typed or said (v1 fallback) ----------
    Used when no Anthropic key is set, or when the LLM call fails.
    Pulls out a food name, an amount, and any numbers she stated.
@@ -182,8 +264,7 @@ function parseInput(text) {
 async function searchOpenFoodFacts(query) {
   const url = "https://world.openfoodfacts.org/cgi/search.pl?search_terms="
     + encodeURIComponent(query) + "&json=1&page_size=5";
-  const res = await fetch(url);
-  if (!res.ok) return [];
+  const res = await fetchWithRetry(url);
   const data = await res.json();
   return (data.products || [])
     .filter(p => p.nutriments && p.nutriments["energy-kcal_100g"] != null)
@@ -209,9 +290,8 @@ function servingToGrams(serving) {
 }
 
 async function lookupBarcode(code) {
-  const res = await fetch("https://world.openfoodfacts.org/api/v0/product/"
+  const res = await fetchWithRetry("https://world.openfoodfacts.org/api/v0/product/"
     + encodeURIComponent(code) + ".json");
-  if (!res.ok) return null;
   const data = await res.json();
   if (data.status !== 1 || !data.product) return null;
   const p = data.product, n = p.nutriments || {};
@@ -231,8 +311,7 @@ async function searchUSDA(query, key) {
   const url = "https://api.nal.usda.gov/fdc/v1/foods/search?api_key="
     + encodeURIComponent(key) + "&query=" + encodeURIComponent(query)
     + "&pageSize=5&dataType=SR%20Legacy,Foundation,Branded";
-  const res = await fetch(url);
-  if (!res.ok) return [];
+  const res = await fetchWithRetry(url);
   const data = await res.json();
   return (data.foods || []).map(f => {
     const byName = {};
@@ -251,12 +330,15 @@ async function searchUSDA(query, key) {
 }
 
 async function lookupCandidates(name) {
-  // Open Food Facts first (no key needed), then USDA if a key is saved.
+  // Open Food Facts and USDA run in parallel — three searches at a time is
+  // the shape of this agent: faster, and one slow source never blocks the other.
   // Returns a short list so she can pick the right match — never just the
   // first result. Empty list means no match: the app says so.
-  const off = await searchOpenFoodFacts(name).catch(() => []);
   const key = localStorage.getItem(USDA_KEY);
-  const usda = key ? await searchUSDA(name, key).catch(() => []) : [];
+  const [off, usda] = await Promise.all([
+    searchOpenFoodFacts(name).catch(() => []),
+    key ? searchUSDA(name, key).catch(() => []) : Promise.resolve([]),
+  ]);
   return off.concat(usda).slice(0, 6);
 }
 
@@ -280,16 +362,19 @@ const LLM_MODEL = "claude-sonnet-4-5";
 const LLM_URL = "https://api.anthropic.com/v1/messages";
 
 const LLM_SYSTEM = [
-  "You interpret messy food logs into structured items. Rules:",
+  "You interpret messy food logs into structured items. This is a fixed workflow, and you work one node at a time:",
+  "NODE 1 — EXTRACT. Pull out each food she ate and the amount for each, if she gave one. That comes first, before any lookup.",
+  "NODE 1b — MEAL FROM THE CLOCK. The app tells you the current time and day. Infer the meal from the time and the size of the meal: 8am–12pm, big meal with several items = breakfast (on a weekend it can be brunch); 12–4pm = lunch; 4pm–late night = dinner. If the meal is much smaller than a main meal for that time — a single small thing — set isSnack true; the app will ask her to confirm it's a snack. The time rules only help you understand the slot; extraction itself doesn't change per meal.",
+  "NODE 2 — LOOK UP, THREE AT A TIME. For each food, call the lookup tools in parallel, up to three tool calls in one block. search_usda for generic foods (rice, dals, vegetables, bread), search_open_food_facts for packaged or branded foods, lookup_barcode when a barcode is given. Pick the best match and remember its id.",
+  "NODE 2b — DISH WITH NO MATCH. If no lookup matches a dish (for example a home dish like bendakaya fry), work out what the dish is, say what your closest find is, break it into its ingredients, and look up each ingredient instead — up to three ingredient lookups in one block. In the final JSON, mark the item with identifiedVia \"ingredients\" and dishGuess as your closest find, so she can confirm or change it. The numbers still come only from the ingredient lookups, never from memory.",
   "- You NEVER state a calorie or macro number from memory. Every number must come from a lookup tool result.",
-  "- For each food, call search_usda (generic foods: rice, dals, vegetables, bread) or search_open_food_facts (packaged or branded foods) or lookup_barcode (when a barcode is given). Pick the best match and remember its id.",
   "- If she stated numbers herself (e.g. \"230 calories, 18g protein\"), keep them in \"stated\" — hers win over the database.",
   "- If no tool returns a match for a food, use matchId null. The app will say it doesn't know.",
   "- If the text refers to something only she knows (\"the usual lunch\", \"the same as yesterday\") and her past meals below don't resolve it, return items [] and a note asking what was in it.",
   "- State any assumption plainly in amountText (e.g. \"half a ~100 g bagel, assumed\").",
-  "- meal: which meal this is, one of breakfast, 11am, lunch, 3pm snack, dinner, extra — or null if she didn't say.",
+  "- meal: which meal this is, one of breakfast, 11am, lunch, 3pm snack, dinner, extra — or null if you genuinely can't tell.",
   "- End with ONLY a JSON object, no other text:",
-  '{"meal":"lunch"|null,"items":[{"name":"...","amountText":"...","grams":number|null,"gramsAssumed":true|false,"matchId":"...|null","stated":{"calories":n,"protein":n,"carbs":n,"fat":n,"fiber":n}}],"note":"..."}',
+  '{"meal":"lunch"|null,"isSnack":true|false,"items":[{"name":"...","amountText":"...","grams":number|null,"gramsAssumed":true|false,"matchId":"...|null","identifiedVia":"ingredients"|null,"dishGuess":"...|null","ingredients":[{"matchId":"...","grams":number}]|null,"stated":{"calories":n,"protein":n,"carbs":n,"fat":n,"fiber":n}}],"note":"..."}',
   "- grams: the amount eaten in grams when you can tell it (a whole bagel ~100 g, half ~50 g, 1 cup cooked rice ~200 g, 1 cup cooked dal ~200 g). Otherwise null.",
   "- Omit any stated field she did not give.",
 ].join("\n");
@@ -339,7 +424,7 @@ async function executeTool(name, input) {
   return JSON.stringify({ error: "Unknown tool." });
 }
 
-async function callClaude(messages) {
+async function callClaudeOnce(messages) {
   const key = localStorage.getItem(ANTHROPIC_KEY);
   const res = await fetch(LLM_URL, {
     method: "POST",
@@ -362,6 +447,21 @@ async function callClaude(messages) {
   return res.json();
 }
 
+// The Claude call itself also gets two tries before the app gives up —
+// network and server errors only; a bad key (401) fails straight away.
+async function callClaude(messages) {
+  let lastErr = null;
+  for (let i = 0; i < 2; i++) {
+    try { return await callClaudeOnce(messages); }
+    catch (e) {
+      lastErr = e;
+      if (!/failed to fetch|network|timeout|timed out|429|5\d\d/i.test(String(e.message || e))) throw e;
+      if (i === 0) await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  throw lastErr;
+}
+
 // Her past meals, from her own log — so "the usual" can resolve to what she
 // actually eats. Only the most common items per meal, kept short.
 function usualsSummary() {
@@ -378,8 +478,13 @@ function usualsSummary() {
 }
 
 async function interpretWithLLM(text) {
+  const now = new Date();
+  const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const timeNote = "Current time: " + now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    + ", " + days[now.getDay()] + (now.getDay() === 0 || now.getDay() === 6 ? " (weekend)" : " (weekday)")
+    + ". Infer the meal from this time and the size of the meal.";
   const messages = [{ role: "user", content:
-    "Her past meals:\n" + usualsSummary() + "\n\nWhat she ate:\n" + text }];
+    timeNote + "\n\nHer past meals:\n" + usualsSummary() + "\n\nWhat she ate:\n" + text }];
   for (let round = 0; round < 6; round++) {
     const data = await callClaude(messages);
     messages.push({ role: "assistant", content: data.content });
@@ -391,11 +496,11 @@ async function interpretWithLLM(text) {
       if (start < 0) throw new Error("LLM did not return JSON.");
       return JSON.parse(raw.slice(start));
     }
-    const results = [];
-    for (const tc of toolCalls) {
+    // Lookups run in parallel, up to three at a time — never one by one.
+    const results = await Promise.all(toolCalls.map(async tc => {
       const out = await executeTool(tc.name, tc.input || {});
-      results.push({ type: "tool_result", tool_use_id: tc.id, content: out });
-    }
+      return { type: "tool_result", tool_use_id: tc.id, content: out };
+    }));
     messages.push({ role: "user", content: results });
   }
   throw new Error("Too many lookup rounds — fell back to simple matching.");
@@ -476,14 +581,55 @@ function setMealOrAsk(meal) {
 
 // Build review items from the LLM's answer. Numbers come from the stored
 // tool results the model chose (by id) — never from the model's own text.
+// A dish with no direct match comes back as ingredients: the app adds up
+// the per-ingredient lookups and shows the closest find for her to confirm.
 function itemsFromLLM(out) {
   return (out.items || []).map(it => {
-    const match = it.matchId ? toolResults[it.matchId] : null;
     const parsed = { grams: it.grams, gramsAssumed: !!it.gramsAssumed,
                      amountText: it.amountText, stated: it.stated || {} };
+    if (it.ingredients && it.ingredients.length) {
+      const parts = it.ingredients.map(g => {
+        const m = g.matchId ? toolResults[g.matchId] : null;
+        return m ? { match: m, grams: g.grams || 100 } : null;
+      }).filter(Boolean);
+      if (!parts.length) return unknownItem({ name: it.name, ...parsed }, "");
+      const summed = { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 };
+      let anyNull = false;
+      parts.forEach(p => {
+        const s = scale(p.match.per100, p.grams);
+        for (const k of Object.keys(summed)) {
+          if (s[k] == null) anyNull = true; else summed[k] += s[k];
+        }
+      });
+      for (const k of Object.keys(summed)) summed[k] = Math.round(summed[k] * 10) / 10;
+      const item = {
+        name: it.name, amountText: it.amountText || "",
+        grams: it.grams || null,
+        source: "Built from ingredients",
+        sourceDetail: "Closest find: " + (it.dishGuess || it.name)
+          + " — built from " + parts.map(p => p.match.name + " (" + p.grams + " g)").join(", ")
+          + ". Check it — change any ingredient below if it's wrong."
+          + (anyNull ? " Some values were missing in the database." : ""),
+        ...summed,
+      };
+      if (parsed.stated) {
+        for (const k of ["calories", "protein", "carbs", "fat", "fiber"]) {
+          if (parsed.stated[k] != null) {
+            item[k] = parsed.stated[k];
+            item.source = "You stated";
+            item.sourceDetail = "You stated these numbers — they win over the database.";
+          }
+        }
+      }
+      return item;
+    }
+    const match = it.matchId ? toolResults[it.matchId] : null;
     if (!match) return unknownItem({ name: it.name, ...parsed }, "");
     const item = buildReviewItem(match, parsed);
     item.name = it.name || match.name; // Her words for the food, database numbers.
+    if (it.identifiedVia === "ingredients" && it.dishGuess) {
+      item.sourceDetail += " Closest find: " + it.dishGuess + " — check it.";
+    }
     return item;
   });
 }
@@ -498,7 +644,15 @@ async function onLookup() {
 
   if (barcode) {
     // Barcode path: one match, no interpretation needed.
-    const match = await lookupBarcode(barcode);
+    let match = null;
+    try {
+      match = await lookupBarcode(barcode);
+    } catch (err) {
+      statusEl.textContent = "Right now I can't do it — the lookup timed out. Try again, or use Fast log below.";
+      $("lookupBtn").disabled = false;
+      renderReview();
+      return;
+    }
     reviewItems = match ? [buildReviewItem(match, null)] : [unknownItem(null, barcode)];
     setMealOrAsk(mealFromText(text));
     statusEl.textContent = match ? "Found it — check below." : "No match for that barcode — check below.";
@@ -513,11 +667,21 @@ async function onLookup() {
         statusEl.textContent = out.note || "I need more detail — what was in it?";
       } else {
         statusEl.textContent = "LLM interpreted it — numbers from the databases. Check below.";
+        if (out.isSnack) showSnackAsk(out.meal);
       }
     } catch (err) {
-      // LLM failed: fall back to simple matching, and say so plainly.
-      statusEl.textContent = "LLM call failed (" + err.message + ") — used simple matching instead.";
-      await fallbackLookup(text);
+      const msg = String(err.message || err);
+      if (/failed to fetch|network|timeout|timed out/i.test(msg)) {
+        // Timeout: tried twice inside the lookups already. Say so plainly,
+        // queue it to retry later, and point at Fast log.
+        queuePending(text, mealFromText(text));
+        statusEl.textContent = "Right now I can't do it — the lookup timed out. "
+          + "It's queued to retry later, or use Fast log below with the macros.";
+      } else {
+        // LLM failed for another reason: fall back to simple matching, and say so plainly.
+        statusEl.textContent = "LLM call failed (" + msg + ") — used simple matching instead.";
+        await fallbackLookup(text);
+      }
     }
   } else {
     // No Anthropic key: v1 simple matching, said plainly.
@@ -549,9 +713,171 @@ function numInput(id, value) {
     + (value == null ? "" : value) + '" placeholder="—">';
 }
 
+/* ---------- Snack check (v3) ----------
+   The meal was inferred from the time — but if it's much smaller than a
+   main meal, ask: is it a snack? One tap either way. */
+function showSnackAsk(inferredMeal) {
+  const box = $("snackAsk");
+  box.classList.remove("hidden");
+  box.innerHTML = '<div class="card snack-note"><p><strong>This looks smaller than a main meal — is it a snack?</strong></p>'
+    + '<button type="button" class="secondary" id="snackYes">Yes, a snack</button> '
+    + '<button type="button" class="secondary" id="snackNo">No, it\'s a meal</button></div>';
+  $("snackYes").addEventListener("click", () => {
+    $("meal").value = "3pm snack";
+    box.classList.add("hidden");
+    statusEl.textContent = "Marked as a snack.";
+  });
+  $("snackNo").addEventListener("click", () => {
+    if (inferredMeal) $("meal").value = inferredMeal;
+    box.classList.add("hidden");
+  });
+}
+
+/* ---------- Review countdown (v3) ----------
+   The review shows what's being logged. If she doesn't reply within
+   60 seconds, it logs as shown — silence is acceptance. Any edit resets
+   the clock. Cancel stops it. */
+let countdownTimer = null;
+let countdownLeft = 0;
+function stopCountdown() {
+  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+  $("countdown").classList.add("hidden");
+}
+function startCountdown() {
+  stopCountdown();
+  if (!$("meal").value) return; // No meal yet — don't auto-log, ask instead.
+  countdownLeft = 60;
+  const el = $("countdown");
+  el.classList.remove("hidden");
+  const tick = () => {
+    el.textContent = "Logging in " + countdownLeft + "s unless you change something — tap Cancel to stop it.";
+    if (countdownLeft <= 0) {
+      stopCountdown();
+      $("saveBtn").click();
+      return;
+    }
+    countdownLeft--;
+  };
+  tick();
+  countdownTimer = setInterval(tick, 1000);
+}
+// Any change to the review resets the clock — she is still deciding.
+$("reviewList").addEventListener("input", () => { if (reviewItems.length) startCountdown(); });
+
+/* ---------- Pending retries (v3) ---------- */
+function renderPending() {
+  const list = loadPending();
+  const sec = $("pendingSection");
+  if (!list.length) { sec.classList.add("hidden"); return; }
+  sec.classList.remove("hidden");
+  $("pendingList").innerHTML = list.map(p =>
+    '<div class="card pending"><strong>' + esc(p.text) + '</strong>'
+    + ' <span class="hint">(' + esc(p.meal || "meal not set") + ', tried ' + p.tries + 'x)</span><br>'
+    + '<button type="button" class="secondary" data-retry="' + p.id + '">Retry now</button> '
+    + '<button type="button" class="secondary" data-fastlog="' + p.id + '">Fast log instead</button> '
+    + '<button type="button" class="danger" data-drop="' + p.id + '">Drop it</button></div>'
+  ).join("");
+}
+$("pendingList").addEventListener("click", async e => {
+  const retryId = e.target.getAttribute("data-retry");
+  const fastId = e.target.getAttribute("data-fastlog");
+  const dropId = e.target.getAttribute("data-drop");
+  const list = loadPending();
+  if (dropId) {
+    savePending(list.filter(p => String(p.id) !== dropId));
+    renderPending();
+    return;
+  }
+  if (fastId) {
+    const p = list.find(x => String(x.id) === fastId);
+    if (p) {
+      $("fastName").value = p.text;
+      if (p.meal) $("fastMeal").value = p.meal;
+      savePending(list.filter(x => String(x.id) !== fastId));
+      renderPending();
+      $("fastName").focus();
+      window.scrollTo({ top: $("fastLogSection").offsetTop, behavior: "smooth" });
+    }
+    return;
+  }
+  if (retryId) {
+    const p = list.find(x => String(x.id) === retryId);
+    if (!p) return;
+    p.tries++;
+    savePending(list);
+    $("foodText").value = p.text;
+    if (p.meal) $("meal").value = p.meal;
+    try {
+      await onLookup();
+      // If the retry produced review items, it worked — drop it from the queue.
+      if (reviewItems.length) {
+        savePending(loadPending().filter(x => String(x.id) !== retryId));
+        renderPending();
+      } else if (p.tries >= 2) {
+        statusEl.textContent = "That one failed again — it's failed. Give the numbers with Fast log below, or drop it.";
+      }
+    } catch (err) {
+      if (p.tries >= 2) {
+        statusEl.textContent = "That one failed again — it's failed. Give the numbers with Fast log below, or drop it.";
+      }
+    }
+    renderPending();
+  }
+});
+
+/* ---------- Fast log (v3) ----------
+   Give the macros and the calories are worked out exactly (4/4/9).
+   Give only the calories and the macros are estimated from her target
+   split — stated plainly, never hidden. */
+$("fastLogBtn").addEventListener("click", () => {
+  const name = $("fastName").value.trim();
+  if (!name) { $("fastStatus").textContent = "Name the food first."; return; }
+  const pro = readNum("fastPro"), carb = readNum("fastCarb"), fat = readNum("fastFat");
+  let cal = readNum("fastCal");
+  let source, sourceDetail;
+  const hasMacros = pro != null || carb != null || fat != null;
+  if (hasMacros && cal == null) {
+    cal = Math.round(((pro || 0) * 4 + (carb || 0) * 4 + (fat || 0) * 9) * 10) / 10;
+    source = "Fast log — macros you gave";
+    sourceDetail = "Calories worked out from your macros (protein × 4 + carbs × 4 + fat × 9).";
+  } else if (cal != null && !hasMacros) {
+    // Estimate macros from her target split (213 C / 105 P / 60 F at ~1,800 kcal):
+    // about 47% of calories from carbs, 23% from protein, 30% from fat.
+    const p = Math.round(cal * 0.23 / 4 * 10) / 10;
+    const c = Math.round(cal * 0.47 / 4 * 10) / 10;
+    const f = Math.round(cal * 0.30 / 9 * 10) / 10;
+    $("fastPro").value = p; $("fastCarb").value = c; $("fastFat").value = f;
+    source = "Fast log — calories you gave";
+    sourceDetail = "Macros estimated from your target split (213 C / 105 P / 60 F) — an estimate, check it.";
+    const entry = { id: Date.now(), date: $("dayPicker").value || todayString(),
+      meal: $("fastMeal").value, name, amountText: $("fastAmount").value.trim(),
+      grams: null, calories: cal, protein: p, carbs: c, fat: f, fiber: null, source, sourceDetail };
+    const list = loadEntries(); list.push(entry); saveEntries(list);
+    $("fastStatus").textContent = "Fast-logged " + cal + " kcal — macros estimated from your target split.";
+    $("fastName").value = ""; $("fastAmount").value = "";
+    $("fastCal").value = ""; $("fastPro").value = ""; $("fastCarb").value = ""; $("fastFat").value = "";
+    renderDay();
+    return;
+  } else if (cal == null && !hasMacros) {
+    $("fastStatus").textContent = "Give either the macros or the calories.";
+    return;
+  } else {
+    source = "Fast log — you gave both";
+    sourceDetail = "You gave the calories and the macros — both used as stated.";
+  }
+  const entry = { id: Date.now(), date: $("dayPicker").value || todayString(),
+    meal: $("fastMeal").value, name, amountText: $("fastAmount").value.trim(),
+    grams: null, calories: cal, protein: pro, carbs: carb, fat: fat, fiber: null, source, sourceDetail };
+  const list = loadEntries(); list.push(entry); saveEntries(list);
+  $("fastStatus").textContent = "Fast-logged " + (cal == null ? "—" : cal + " kcal") + ".";
+  $("fastName").value = ""; $("fastAmount").value = "";
+  $("fastCal").value = ""; $("fastPro").value = ""; $("fastCarb").value = ""; $("fastFat").value = "";
+  renderDay();
+});
+
 function renderReview() {
   const sec = $("reviewSection");
-  if (!reviewItems.length) { sec.classList.add("hidden"); return; }
+  if (!reviewItems.length) { sec.classList.add("hidden"); stopCountdown(); return; }
   sec.classList.remove("hidden");
   let html = "";
   reviewItems.forEach((r, i) => {
@@ -586,6 +912,7 @@ function renderReview() {
   });
   $("reviewList").innerHTML = html;
   $("saveBtn").focus();
+  startCountdown(); // Silence logs it — the clock is on the screen, plain to see.
 }
 
 // Picking a different database match rebuilds that item from that match.
@@ -617,6 +944,7 @@ function readNum(id) {
 let editingId = null; // When set, saving replaces that entry instead of adding one.
 
 $("saveBtn").addEventListener("click", () => {
+  stopCountdown();
   // No meal named? Ask — never silently file under "extra".
   if (!$("meal").value) {
     statusEl.textContent = "Which meal was this? Pick one above first.";
@@ -627,6 +955,16 @@ $("saveBtn").addEventListener("click", () => {
   if (editingId != null) list = list.filter(x => String(x.id) !== String(editingId));
   editingId = null;
   const date = $("dayPicker").value || todayString();
+  // Snack check: if this log is a snack, total its calories for the note.
+  const isSnackMeal = $("meal").value === "3pm snack" || $("meal").value === "extra";
+  let loggedSnackKcal = null;
+  if (isSnackMeal) {
+    loggedSnackKcal = 0;
+    reviewItems.forEach((r, i) => {
+      const c = readNum("revCal-" + i);
+      if (c != null) loggedSnackKcal += c;
+    });
+  }
   reviewItems.forEach((r, i) => {
     const source = r.source === "unknown"
       ? ($("revCal-" + i).value.trim() ? "label" : "unknown") : r.source;
@@ -645,11 +983,20 @@ $("saveBtn").addEventListener("click", () => {
   reviewItems = [];
   $("reviewSection").classList.add("hidden");
   $("foodText").value = ""; $("barcode").value = "";
-  statusEl.textContent = "Logged.";
+  // Snack note: small and positive. If the meal was a snack, say how it
+  // landed — light and on track, or a bigger one worth noticing.
+  const snackKcal = loggedSnackKcal;
+  statusEl.textContent = "Logged."
+    + (snackKcal != null
+      ? (snackKcal <= 200
+        ? " Nice snack — light, you're on track."
+        : " That's a bigger snack — still fine, just keep the next meal a touch lighter.")
+      : "");
   renderDay();
 });
 
 $("cancelBtn").addEventListener("click", () => {
+  stopCountdown();
   reviewItems = [];
   editingId = null;
   $("reviewSection").classList.add("hidden");
@@ -878,6 +1225,28 @@ $("saveKeys").addEventListener("click", () => {
 $("dayPicker").value = todayString();
 $("dayPicker").addEventListener("change", renderDay);
 renderDay();
+renderPending();
+// Scheduled retry: anything that timed out earlier gets one more try when
+// the app opens — the oldest one only. If it fails twice, it stays queued
+// for her to fast-log or drop; the app doesn't keep retrying on its own.
+(async () => {
+  const pending = loadPending().filter(p => p.tries < 2);
+  if (!pending.length || $("foodText").value.trim()) return;
+  const p = pending[0];
+  p.tries++;
+  savePending(loadPending().map(x => x.id === p.id ? p : x));
+  $("foodText").value = p.text;
+  if (p.meal) $("meal").value = p.meal;
+  try {
+    await onLookup();
+    if (reviewItems.length) {
+      savePending(loadPending().filter(x => x.id !== p.id));
+      renderPending();
+      statusEl.textContent = "Retried your queued item — check below before it logs.";
+    }
+  } catch (e) { /* Stays queued; she can retry, fast-log, or drop it. */ }
+  renderPending();
+})();
 </script>
 </body>
 </html>
